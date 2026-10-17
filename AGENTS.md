@@ -1,13 +1,16 @@
 # AGENTS.md — SideChat plugin
 
-Guidance for AI agents working in this repository. SideChat is a single-file
-OpenCode **V2** TUI plugin (`tui.tsx`) rendered in the `session.panel` slot.
-Use V2 APIs only (`@opencode/plugin/tui`, `@opentui/*`, `solid-js`); never
+Guidance for AI agents working in this repository. SideChat is an OpenCode
+**V2** plugin: the panel (`tui.tsx`) renders in the `session.panel` slot and
+a server half (`index.ts`) injects hidden main context per request.
+Use V2 APIs only (`@opencode/plugin`, `@opencode/plugin/tui`, `@opentui/*`, `solid-js`); never
 suggest V1 APIs, and note V2 recognizes `AGENTS.md` only (no `CLAUDE.md`).
 
 ## Layout
 
-- `tui.tsx` is the whole plugin; `README.md` is the user-facing documentation.
+- `tui.tsx` is the panel; `index.ts` is the server half (registered beside the
+  `./tui` entry, hidden-context hooks); `README.md` is the user-facing
+  documentation.
 - `package.json` declares peer dependencies only: there is no install step and
   no build step, and nothing here is published to a registry.
 - Keep tracked files portable and public-repo safe: no absolute or
@@ -21,8 +24,8 @@ for logic changes.
 
 ### Type check
 
-`tui.tsx` must type-check against the same OpenTUI API the OpenCode runtime
-bundles. Pin `@opentui/*` to **0.5.17**: OpenCode 2.0.x embeds a
+Both `tui.tsx` and `index.ts` must type-check; the panel uses the same OpenTUI
+API the OpenCode runtime bundles. Pin `@opentui/*` to **0.5.17**: OpenCode 2.0.x embeds a
 single-argument `SyntaxStyle.fromStyles`, while 0.6.0+ require a second
 `owner` argument and report two false errors. Build a scratch project in
 `.check/` (gitignored) at the repo root:
@@ -69,13 +72,14 @@ cat > tsconfig.json <<'JSON'
     "noEmit": true,
     "paths": {
       "@opencode/plugin/tui": ["./host.d.ts"],
+      "@opencode/plugin": ["./host.d.ts"],
       "@opentui/core": ["./node_modules/@opentui/core"],
       "@opentui/solid": ["./node_modules/@opentui/solid"],
       "@opentui/solid/jsx-runtime": ["./node_modules/@opentui/solid/jsx-runtime.d.ts"],
       "solid-js": ["./node_modules/solid-js"]
     }
   },
-  "include": ["../tui.tsx", "./events.d.ts"]
+  "include": ["../index.ts", "../tui.tsx", "./events.d.ts"]
 }
 JSON
 ```
@@ -93,10 +97,25 @@ TypeScript 7's package exposes no compiler API. Scripts that need
 ### Behavior check
 
 For session, command, or context logic, exercise the real functions instead of
-reasoning alone: parse `tui.tsx` with `ts.createSourceFile`, keep the
+reasoning alone: parse the relevant `tui.tsx`/`index.ts` with
+`ts.createSourceFile`, keep the
 `ts.isFunctionDeclaration` nodes you need, `ts.transpileModule` them into a
 `node:vm` sandbox alongside a mocked `context`, and assert the calls they make.
 Keep such scripts in a scratch directory, never in the repo.
+Cover window filtering/bounds, session-metadata flags, history assembly,
+close/reopen ordering, per-tab agent behavior, and transcript export (including
+unsupported OSC 52 handling). Smoke-test against an isolated
+OpenCode server; a mock provider is sufficient to inspect request/history
+separation without spending model credits.
+
+### Transcript copy
+
+- Keep `/copy` scoped to the active SideChat session.
+- Export visible user questions, final assistant answers, and context omission
+  notes only. Never include hidden parent context, reasoning, tool output, or
+  messages from the main session.
+- If the renderer cannot copy through OSC 52, show a warning and leave session
+  history unchanged.
 
 ### Report honestly
 
@@ -113,22 +132,33 @@ The README carries the detail; these are the non-negotiables:
 - Keep the header compact and tab labels visible; the edge handle must keep the
   same position as the panel opens and closes.
 - Side chats are isolated: never append side-chat messages to the main session.
+  History's “open in main view” may navigate to the child, never copy its text.
 - Create every side chat as a child of the main session (`parentID`) — the host
   lists root sessions only, so this is what keeps side chats out of the session
   list, and it also inherits the main session's location. Never create them as
   root sessions.
-- Main context is incremental and bounded (30 messages / 40,000 characters).
-  Never resend the full transcript or pull context just because the panel opened.
-- Preserve Plan mode, Esc interrupt semantics (Esc, then Esc within five
-  seconds), slash-command autocomplete, drafts, and tab lifecycle.
+- Main context is bounded (30 messages / 40,000 characters), hidden from the
+  side transcript, refreshed per request, never the full transcript. Never
+  pull main context just because the panel opened.
+- Plan is the creation default, not an enforced mode: preserve deliberate
+  per-tab agent choices. Never switch agents/models just to open or send.
+- Closing preserves the original strip index. Cap the quick closed list at
+  20 without deleting saved sessions or losing their SideChat identity. History
+  deletion requires confirmation and a fresh busy check before removal.
+- Unread compares updated/viewed timestamps plus the last visibly observed
+  per-tab update. Acknowledge real idle boundaries only, never invent one to
+  clear a metadata-only unread badge.
+- Preserve Esc interrupt semantics (Esc, then Esc within five seconds),
+  slash-command autocomplete, drafts, and tab lifecycle.
 - Use OpenTUI/Solid APIs, not web DOM/CSS.
 - Prefer event-driven session updates over polling, and clean up listeners and
   subscriptions on unmount.
 
 ## Working agreements
 
-- Keep the plugin a single `tui.tsx` plus `README.md`. Ask before adding files,
-  dependencies, or tooling to the repo.
+- Keep the plugin a `tui.tsx` (panel) plus `index.ts` (server half) and
+  `README.md`. Ask before adding files, dependencies, or tooling to
+  the repo.
 - Commit only when asked, with a descriptive subject (plugin changes use a
   `SideChat: <change>` prefix). Each change lands as a new commit: never
   amend, squash, rebase, or force-push commits that are already public.

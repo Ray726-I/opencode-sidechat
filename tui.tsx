@@ -3,7 +3,7 @@
  *
  * A persistent, isolated conversation rendered in the `session.panel` slot.
  * Its transcript never touches the main chat; the main conversation is only
- * borrowed on demand as context (toggle with alt+c).
+ * borrowed as hidden request context (toggle the current tab with alt+c).
  *
  * Keybinds (global):
  *   alt+n        toggle the side chat panel
@@ -11,7 +11,7 @@
  *   alt+shift+w  close the current side chat
  *   alt+[        previous side chat
  *   alt+]        next side chat
- *   alt+c        toggle "include main transcript" context
+ *   alt+c        toggle hidden main context for the current tab
  *
  * Side chats are stored per main session (durable plugin storage) and their
  * messages live in the session database, so everything survives restarts.
@@ -24,15 +24,14 @@ import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, on
 
 const PANEL = "sidechat.panel"
 const SIDE_AGENT = "plan"
-const MAX_CONTEXT_CHARS = 40_000
-const MAX_CONTEXT_MESSAGES = 30
-const CONTEXT_RECEIPT = "sidechat_context_v1"
+const SIDECHAT_QUESTION = "sidechat_question_v1"
 const TITLE_MAX = 36
 const TAB_WIDTH = 13
+const CLOSED_LIMIT = 20
 
-type ChatEntry = { id: string; title: string }
+type ChatEntry = { id: string; title: string; includeContext?: boolean; closedIndex?: number; viewedUpdated?: number }
 type Chats = Record<string, { active: number; list: ChatEntry[] }>
-type Settings = { includeContext: boolean; chats: Chats; closed?: Record<string, ChatEntry[]> }
+type Settings = { chats: Chats; closed?: Record<string, ChatEntry[]> }
 type Runtime = {
   drafts: Record<string, string>
   submitting: Record<string, boolean>
@@ -49,153 +48,8 @@ type SideChatCommand = {
   run: () => void | Promise<void>
 }
 
-type ContextReceipt = {
-  version: 1
-  mainID: string
-  sequence: number
-  sideCompaction: string
-  mainRevert: string
-  seen: Record<string, string>
-}
-type ContextRow = { id: string; role: "user" | "assistant"; text: string; digest: string }
-
 function isInterruption(error: any) {
   return (error?.message ?? error) === "Step interrupted"
-}
-
-function activeHistory(messages: any[], revertID?: string) {
-  if (!revertID) return messages
-  const index = messages.findIndex((message) => message.id === revertID)
-  return index < 0 ? messages : messages.slice(0, index)
-}
-
-function contextReceipt(value: any, mainID: string): ContextReceipt | undefined {
-  if (!value || value.version !== 1 || value.mainID !== mainID) return
-  if (!Number.isSafeInteger(value.sequence) || value.sequence < 1) return
-  if (typeof value.sideCompaction !== "string" || typeof value.mainRevert !== "string") return
-  if (!value.seen || typeof value.seen !== "object" || Array.isArray(value.seen)) return
-  const entries = Object.entries(value.seen)
-  if (entries.length > MAX_CONTEXT_MESSAGES) return
-  if (!entries.every(([id, digest]) => id.startsWith("msg_") && typeof digest === "string" && /^[a-f0-9]{64}$/.test(digest))) return
-  return value as ContextReceipt
-}
-
-function latestContextReceipt(mainID: string, history: any[], pending: any[]) {
-  let latest: ContextReceipt | undefined
-  for (const timeline of [history, pending]) {
-    for (let index = timeline.length - 1; index >= 0; index--) {
-      const message = timeline[index]
-      if (message.type !== "user") continue
-      const metadata = message.payload?.metadata ?? message.metadata
-      const receipt = contextReceipt(metadata?.[CONTEXT_RECEIPT], mainID)
-      if (!receipt) continue
-      if (!latest || receipt.sequence > latest.sequence) latest = receipt
-      break
-    }
-  }
-  return latest
-}
-
-async function contextDigest(text: string) {
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))
-  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("")
-}
-
-async function contextRows(history: any[]): Promise<ContextRow[]> {
-  const recent: { id: string; role: "user" | "assistant"; text: string }[] = []
-  const seen = new Set<string>()
-  for (let index = history.length - 1; index >= 0 && recent.length < MAX_CONTEXT_MESSAGES; index--) {
-    const message = history[index]
-    if (typeof message.id !== "string" || !message.id.startsWith("msg_")) continue
-    if (seen.has(message.id)) continue
-    if (message.type !== "user" && message.type !== "assistant") continue
-    // Sharing partial output would require repeatedly replacing the same reply.
-    if (message.type === "assistant" && message.time?.completed == null) continue
-    const text = message.type === "user"
-      ? String(message.text ?? "")
-      : (message.content ?? [])
-          .filter((part: any) => part.type === "text")
-          .map((part: any) => String(part.text ?? ""))
-          .join("\n")
-    if (text.trim()) {
-      recent.push({ id: message.id, role: message.type, text })
-      seen.add(message.id)
-    }
-  }
-  // Only these bounded fingerprints are stored. Transcript text stays in OpenCode.
-  return Promise.all(recent.reverse().map(async (row) => ({
-    ...row,
-    digest: await contextDigest(`${row.role}\n${row.text}`),
-  })))
-}
-
-function boundedContext(rows: ContextRow[], header: string, previous?: ContextReceipt) {
-  const blocks: string[] = []
-  let remaining = MAX_CONTEXT_CHARS - header.length - 256
-  let omitted = 0
-  for (const row of [...rows].reverse()) {
-    const label = `${previous?.seen[row.id] ? "updated " : ""}${row.role} [${row.id}]:\n`
-    let text = row.text
-    if (label.length + text.length > remaining) {
-      if (blocks.length || remaining < label.length + 128) {
-        omitted++
-        continue
-      }
-      const marker = "\n[…middle omitted to fit the context limit…]\n"
-      const available = remaining - label.length - marker.length
-      text = text.slice(0, Math.floor(available / 2)) + marker + text.slice(-Math.ceil(available / 2))
-    }
-    const block = label + text
-    blocks.unshift(block)
-    remaining -= block.length + 2
-  }
-  const note = omitted ? `\n[${omitted} older message(s) omitted from this batch to fit the context limit.]` : ""
-  return header + blocks.join("\n\n") + note
-}
-
-async function prepareMainContext(context: any, mainID: string, sideID: string) {
-  // Fail the send if context cannot be refreshed, rather than sharing stale data.
-  await Promise.all([
-    context.data.session.sync(mainID),
-    context.data.session.message.sync(mainID),
-    context.data.session.sync(sideID),
-    context.data.session.message.sync(sideID),
-    context.data.session.pending.sync(sideID),
-  ])
-  const mainRevert = context.data.session.get(mainID)?.revert?.messageID ?? ""
-  const sideRevert = context.data.session.get(sideID)?.revert?.messageID
-  const main = activeHistory(context.data.session.message.list(mainID) ?? [], mainRevert)
-  const side = activeHistory(context.data.session.message.list(sideID) ?? [], sideRevert)
-  const previous = latestContextReceipt(mainID, side, context.data.session.pending.list(sideID) ?? [])
-  const sideCompaction = [...side].reverse().find((message) =>
-    message.type === "compaction" && message.status === "completed",
-  )?.id ?? ""
-  const rows = await contextRows(main)
-  const sourceIDs = new Set(main.map((message) => message.id))
-  const previousIDs = Object.keys(previous?.seen ?? {})
-  const historyChanged = previousIDs.some((id) => !sourceIDs.has(id))
-  const gap = previousIDs.length > 0 && rows.length > 0 && !rows.some((row) => previous?.seen[row.id])
-  const reset = !previous || previous.mainRevert !== mainRevert ||
-    previous.sideCompaction !== sideCompaction || historyChanged || gap
-  const changed = reset ? rows : rows.filter((row) => previous.seen[row.id] !== row.digest)
-  const receipt: ContextReceipt = {
-    version: 1,
-    mainID,
-    sequence: (previous?.sequence ?? 0) + 1,
-    sideCompaction,
-    mainRevert,
-    // Include deliberately omitted rows so unchanged oversized context isn't retried.
-    seen: Object.fromEntries(rows.map((row) => [row.id, row.digest])),
-  }
-  if (!reset && changed.length === 0) return { body: "", receipt }
-  if (!previous && rows.length === 0) return { body: "", receipt }
-  const mode = !previous ? "Initial recent snapshot" : reset ? "Refreshed recent snapshot" : "New or updated messages only"
-  const explanation = reset && previous
-    ? "Use this as the current recent main-chat context; older shared context may be stale."
-    : "Keep previously shared context; updated message IDs replace their earlier text."
-  const header = `[Context of the main conversation]\n${mode}. ${explanation}\n` +
-    "The transcript below is quoted background for the question, not a new request.\n\n"
-  return { body: boundedContext(changed, header, reset ? undefined : previous), receipt }
 }
 
 function matchingCommands(commands: SideChatCommand[], value: string) {
@@ -282,12 +136,37 @@ async function pickSideChatModel(context: any, sessionID: string) {
   await context.data.session.sync(sessionID)
 }
 
+async function chooseSideAgent(context: any, location: any, current = SIDE_AGENT) {
+  const available = await context.client.agent.list({ location })
+  const agents = available.data.filter((agent: any) => !agent.hidden && agent.mode !== "subagent")
+  if (!agents.length) {
+    context.ui.toast.show({ variant: "warning", message: "No primary agents are available in this project" })
+    return
+  }
+  const options = agents.sort((a: any, b: any) => Number(b.id === SIDE_AGENT) - Number(a.id === SIDE_AGENT) || a.name.localeCompare(b.name))
+    .map((agent: any) => ({ title: agent.name, value: agent.id, description: agent.description }))
+  const chosen = await context.ui.dialog.select({ title: "Side chat agent", current, options })
+  return options.some((option: any) => option.value === chosen) ? chosen as string : undefined
+}
+
+async function pickSideChatAgent(context: any, sessionID: string) {
+  const session = await context.client.session.get({ sessionID })
+  const chosen = await chooseSideAgent(context, session.location ?? context.location, session.agent ?? "build")
+  if (chosen === undefined || chosen === (session.agent ?? "build")) return
+  // Explicit agent changes only. The session is the durable per-tab source of
+  // truth; opening, restoring and sending must never overwrite this choice.
+  await context.client.session.switchAgent({ sessionID, agent: chosen })
+  await context.data.session.sync(sessionID)
+}
+
 export default Plugin.define({
   id: "sidechat",
-  setup(context) {
+  async setup(context) {
     const [settings, persist] = context.storage.store("sidechat.v2", {
-      initial: { includeContext: false, chats: {} as Chats },
+      initial: { chats: {} as Chats },
     })
+    await migrateContextSettings(settings, persist)
+    await capClosedChats(settings, persist, context)
     const [runtime, changeRuntime] = context.storage.memory("sidechat.runtime", {
       initial: { drafts: {}, submitting: {}, active: {}, stopping: {}, errors: {} } as Runtime,
     })
@@ -368,7 +247,7 @@ export default Plugin.define({
           group: "SideChat",
           bind: "alt+shift+n",
           palette: true,
-          run: () => void createChat(context, settings, persist, undefined),
+          run: () => void createChat(context, settings, persist, undefined, true),
         },
         {
           id: "sidechat.close",
@@ -406,15 +285,11 @@ export default Plugin.define({
         {
           id: "sidechat.context",
           title: "SideChat: toggle main context",
-          description: "Include the main session transcript in the next side question",
+          description: "Toggle hidden main context for the current side tab",
           group: "SideChat",
           bind: "alt+c",
           palette: true,
-          run: () => {
-            void persist((draft) => {
-              draft.includeContext = !draft.includeContext
-            })
-          },
+          run: () => void toggleMainContext(context, settings, persist),
         },
       ],
     }))
@@ -514,16 +389,148 @@ function chatsOf(mainID: string, settings: Settings) {
   return settings.chats[mainID] ?? { active: 0, list: [] }
 }
 
-async function ensurePlanAgent(context: any, sessionID: string) {
-  const session = await context.client.session.get({ sessionID })
-  if (session.agent === SIDE_AGENT) return
-  await context.client.session.switchAgent({ sessionID, agent: SIDE_AGENT })
-  // Keep the side chat's selected model when changing its agent.
-  if (session.model) await context.client.session.switchModel({ sessionID, model: session.model })
-  await context.data.session.sync(sessionID)
+async function preserveClosedHistory(context: any, mainID: string, entries: ChatEntry[]) {
+  // Legacy tabs may predate the metadata marker. Before dropping their local
+  // identity, mark the saved child so /history can still find it in the DB.
+  for (const entry of entries.slice(0, Math.max(0, entries.length - CLOSED_LIMIT))) {
+    try { await configureSideContext(context, mainID, entry.id, entryContext(entry)) } catch (cause: any) {
+      if (cause?._tag !== "SessionNotFoundError") throw cause
+    }
+  }
 }
 
-async function createChat(context: any, settings: Settings, persist: any, mainID: string | undefined) {
+async function capClosedChats(settings: Settings, persist: any, context: any) {
+  if (!Object.values(settings.closed ?? {}).some((entries) => entries.length > CLOSED_LIMIT)) return
+  for (const [mainID, entries] of Object.entries(settings.closed ?? {})) await preserveClosedHistory(context, mainID, entries)
+  await persist((draft: Settings) => {
+    for (const key of Object.keys(draft.closed ?? {})) draft.closed![key] = draft.closed![key].slice(-CLOSED_LIMIT)
+  })
+}
+
+async function migrateContextSettings(settings: Settings, persist: any) {
+  const entries = [...Object.values(settings.chats).flatMap((chats) => chats.list), ...Object.values(settings.closed ?? {}).flat()]
+  if (!("includeContext" in settings) && entries.every((entry) => typeof entry.includeContext === "boolean")) return
+  await persist((draft: Settings & { includeContext?: boolean }) => {
+    const legacy = draft.includeContext === true
+    for (const entry of [...Object.values(draft.chats).flatMap((chats) => chats.list), ...Object.values(draft.closed ?? {}).flat()]) {
+      entry.includeContext ??= legacy
+    }
+    delete draft.includeContext
+  })
+}
+
+const contextWrites = new Map<string, Promise<boolean>>()
+
+async function configureSideContext(context: any, mainID: string, sideID: string, fallback: boolean, change?: boolean | "toggle") {
+  // Metadata PATCH replaces the object: preserve unrelated keys, and serialize
+  // this TUI's rapid toggles/sends so each one reads the preceding write.
+  const previous = contextWrites.get(sideID)
+  const write = (async () => {
+    await previous?.catch(() => undefined)
+    const session = await context.client.session.get({ sessionID: sideID })
+    if (session.parentID !== mainID) throw new Error("SideChat parent does not match the main session")
+    const old = session.metadata?.sidechat
+    const valid = old?.version === 1 && old.mainID === mainID && typeof old.includeContext === "boolean"
+    const current = valid ? old.includeContext : fallback
+    const enabled = change === "toggle" ? !current : change ?? current
+    if (!valid || current !== enabled) {
+      await context.client.session.update({
+        sessionID: sideID,
+        metadata: { ...session.metadata, sidechat: { ...old, version: 1, mainID, includeContext: enabled } },
+      })
+      await context.data.session.sync(sideID)
+    }
+    return enabled as boolean
+  })()
+  contextWrites.set(sideID, write)
+  try { return await write } finally {
+    if (contextWrites.get(sideID) === write) contextWrites.delete(sideID)
+  }
+}
+
+function entryContext(entry: ChatEntry | undefined) {
+  return entry?.includeContext ?? false
+}
+
+async function rememberSideContext(persist: any, mainID: string, sideID: string, enabled: boolean) {
+  await persist((draft: Settings) => {
+    for (const entry of [...(draft.chats[mainID]?.list ?? []), ...(draft.closed?.[mainID] ?? [])]) {
+      if (entry.id === sideID) entry.includeContext = enabled
+    }
+  })
+}
+
+async function toggleMainContext(context: any, settings: Settings, persist: any, mainID?: string) {
+  const route = context.ui.router.current()
+  const key = mainID ?? (route.type === "session" ? route.sessionID : undefined)
+  const chats = key ? chatsOf(key, settings) : undefined
+  const entry = chats?.list[chats.active]
+  if (!key || !entry) return
+  try {
+    const enabled = await configureSideContext(context, key, entry.id, entryContext(entry), "toggle")
+    await rememberSideContext(persist, key, entry.id, enabled)
+  } catch (cause: unknown) {
+    context.ui.toast.show({ variant: "error", message: `Could not change main context: ${String((cause as any)?.message ?? cause)}` })
+  }
+}
+
+function sideQuestionText(message: any) {
+  const question = message.metadata?.[SIDECHAT_QUESTION]
+  return typeof question === "string" ? question : String(message.text ?? "")
+}
+
+function contextOmissionNote(message: any) {
+  const stats = message.metadata?.sidechat_context_window_v1
+  if (stats?.version !== 1 || stats.enabled !== true ||
+    ![stats.included, stats.omitted, stats.truncated].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+    (!stats.omitted && !stats.truncated)) return ""
+  return `Main context at send: ${stats.included} messages · ${stats.omitted} omitted · ${stats.truncated} shortened`
+}
+
+function copyableSideTranscript(messages: any[]) {
+  const blocks: string[] = []
+  for (const message of messages) {
+    if (message.type === "user") {
+      const question = sideQuestionText(message).trim()
+      if (!question) continue
+      const note = contextOmissionNote(message)
+      blocks.push(["You:", question, note].filter(Boolean).join("\n"))
+      continue
+    }
+    if (message.type !== "assistant" || (message.finish === "tool-calls" && !message.error)) continue
+    const answer = (message.content ?? []).filter((part: any) => part.type === "text")
+      .map((part: any) => String(part.text ?? "").trim()).filter(Boolean).join("\n")
+    const error = message.error ? `Error: ${String(message.error.message ?? message.error)}` : ""
+    const text = [answer, error].filter(Boolean).join("\n")
+    if (text) blocks.push(`Assistant:\n${text}`)
+  }
+  return blocks.join("\n\n")
+}
+
+async function copySideTranscript(context: any, sessionID: string) {
+  await context.data.session.message.sync(sessionID)
+  const text = copyableSideTranscript(context.data.session.message.list(sessionID) ?? [])
+  if (!text) {
+    context.ui.toast.show({ message: "This side chat has no questions or answers to copy", variant: "info" })
+    return false
+  }
+  if (typeof context.renderer.copyToClipboardOSC52 !== "function" || !context.renderer.copyToClipboardOSC52(text)) {
+    context.ui.toast.show({ message: "This terminal does not support OSC 52 clipboard copying", variant: "warning" })
+    return false
+  }
+  context.ui.toast.show({ message: "Side chat transcript copied to clipboard", variant: "success" })
+  return true
+}
+
+async function sendSideQuestion(context: any, sessionID: string, question: string, location: any) {
+  const plugins = await context.client.plugin.list({ location })
+  if (!plugins.data.some((plugin: any) => plugin.id === "sidechat.server" && plugin.state?.status === "active")) {
+    throw new Error("SideChat server plugin is not active; check the plugins entry in opencode.json")
+  }
+  await context.client.session.prompt({ sessionID, text: question, metadata: { [SIDECHAT_QUESTION]: question } })
+}
+
+async function createChat(context: any, settings: Settings, persist: any, mainID: string | undefined, chooseAgent = false) {
   const route = context.ui.router.current()
   const key = mainID || (route.type === "session" ? route.sessionID : undefined)
   if (!key) {
@@ -533,9 +540,13 @@ async function createChat(context: any, settings: Settings, persist: any, mainID
   const title = (context.data.session.get(key)?.title ?? "session").slice(0, 40)
   const model = context.ui.model.current()
   try {
+    // Implicit first/replacement tabs stay Plan without interrupting panel open
+    // with a dialog. Manual new-chat actions offer a creation-time choice.
+    const agent = chooseAgent ? await chooseSideAgent(context, context.data.session.get(key)?.location ?? context.location) : SIDE_AGENT
+    if (agent === undefined) return
     const created = await context.client.session.create({
       title: `SideChat · ${title}`,
-      agent: SIDE_AGENT,
+      agent,
       // Child of the main session: the session list only shows root sessions,
       // so side chats stay out of it and inherit the main session's location.
       parentID: key,
@@ -543,7 +554,8 @@ async function createChat(context: any, settings: Settings, persist: any, mainID
         ? { model: { providerID: model.providerID, id: model.modelID, ...(model.variant ? { variant: model.variant } : {}) } }
         : {}),
     })
-    const entry = { id: created.id, title: "New chat" }
+    await configureSideContext(context, key, created.id, true)
+    const entry = { id: created.id, title: "New chat", includeContext: true }
     await persist((draft: Settings) => {
       const chats = draft.chats[key] ?? { active: -1, list: [] }
       chats.list = [...chats.list, entry]
@@ -556,13 +568,27 @@ async function createChat(context: any, settings: Settings, persist: any, mainID
   }
 }
 
+const closeWrites = new Map<string, Promise<void>>()
+
 async function closeChat(context: any, settings: Settings, persist: any, mainID?: string, entryID?: string) {
   const route = context.ui.router.current()
   const key = mainID || (route.type === "session" ? route.sessionID : undefined)
   if (!key) return
+  const previous = closeWrites.get(key)
+  const write = (async () => { await previous?.catch(() => undefined); await closeChatNow(context, settings, persist, key, entryID) })()
+  closeWrites.set(key, write)
+  try { await write } catch (cause: any) {
+    context.ui.toast.show({ variant: "error", message: `Could not close side chat: ${String(cause?.message ?? cause)}` })
+  } finally {
+    if (closeWrites.get(key) === write) closeWrites.delete(key)
+  }
+}
+
+async function closeChatNow(context: any, settings: Settings, persist: any, key: string, entryID?: string) {
   const chats = chatsOf(key, settings)
   const entry = entryID ? chats.list.find((item) => item.id === entryID) : chats.list[chats.active]
   if (!entry) return
+  await preserveClosedHistory(context, key, [...(settings.closed?.[key] ?? []).filter((item) => item.id !== entry.id), entry])
   await persist((draft: Settings) => {
     const current = draft.chats[key] ?? { active: 0, list: [] }
     const activeID = current.list[current.active]?.id
@@ -573,7 +599,7 @@ async function closeChat(context: any, settings: Settings, persist: any, mainID?
       : current.list.findIndex((item) => item.id === activeID))
     draft.chats[key] = current
     draft.closed ??= {}
-    draft.closed[key] = [...(draft.closed[key] ?? []).filter((item) => item.id !== entry.id), entry]
+    draft.closed[key] = [...(draft.closed[key] ?? []).filter((item) => item.id !== entry.id), { ...entry, closedIndex }].slice(-CLOSED_LIMIT)
   })
   // Keep at least one chat available.
   if (chatsOf(key, settings).list.length === 0) {
@@ -588,17 +614,195 @@ async function reopenChat(context: any, settings: Settings, persist: any, mainID
   const entry = key ? settings.closed?.[key]?.at(-1) : undefined
   if (!key || !entry) return
   try {
-    await context.client.session.get({ sessionID: entry.id })
-    await persist((draft: Settings) => {
-      const chats = draft.chats[key] ?? { active: 0, list: [] }
-      if (!chats.list.some((item) => item.id === entry.id)) chats.list = [...chats.list, entry]
-      chats.active = chats.list.findIndex((item) => item.id === entry.id)
-      draft.chats[key] = chats
-      if (draft.closed?.[key]) draft.closed[key] = draft.closed[key].filter((item) => item.id !== entry.id)
-    })
+    await restoreChat(context, settings, persist, key, entry, true)
   } catch (cause: unknown) {
     context.ui.toast.show({ variant: "error", message: `Could not reopen side chat: ${String((cause as any)?.message ?? cause)}` })
   }
+}
+
+async function restoreChat(context: any, settings: Settings, persist: any, mainID: string, entry: ChatEntry, select: boolean) {
+  const session = await context.client.session.get({ sessionID: entry.id })
+  if (session.parentID !== mainID) throw new Error("SideChat parent does not match the main session")
+  await persist((draft: Settings) => {
+    const chats = draft.chats[mainID] ?? { active: 0, list: [] }
+    const activeID = chats.list[chats.active]?.id
+    if (!chats.list.some((item) => item.id === entry.id)) {
+      const { closedIndex, ...restored } = entry
+      const index = Number.isInteger(closedIndex) ? Math.max(0, Math.min(closedIndex!, chats.list.length)) : chats.list.length
+      chats.list = [...chats.list.slice(0, index), restored, ...chats.list.slice(index)]
+    }
+    chats.active = Math.max(0, chats.list.findIndex((item) => item.id === (select ? entry.id : activeID)))
+    draft.chats[mainID] = chats
+    if (draft.closed?.[mainID]) draft.closed[mainID] = draft.closed[mainID].filter((item) => item.id !== entry.id)
+  })
+}
+
+function sideChatBusy(context: any, runtime: Runtime, id: string) {
+  return context.data.session.status(id) === "running" || !!runtime.active[id] || !!runtime.submitting[id] || !!runtime.stopping[id]
+}
+
+function sideViewed(settings: Settings, mainID: string, id: string) {
+  return [...chatsOf(mainID, settings).list, ...(settings.closed?.[mainID] ?? [])].find((entry) => entry.id === id)?.viewedUpdated ?? 0
+}
+
+function sideChatUnread(session: any, observed = 0) {
+  return (session?.time?.updated ?? 0) > Math.max(session?.time?.viewed ?? 0, observed)
+}
+
+function historyAge(created: number | undefined, now: number) {
+  const minutes = Math.floor(Math.max(0, now - (created ?? now)) / 60_000)
+  return minutes < 1 ? "just now" : minutes < 60 ? `${minutes}m old` : minutes < 1440 ? `${Math.floor(minutes / 60)}h old` : `${Math.floor(minutes / 1440)}d old`
+}
+
+function isSideHistorySession(session: any, mainID: string, settings: Settings) {
+  if (session.parentID !== mainID) return false
+  const known = [...chatsOf(mainID, settings).list, ...(settings.closed?.[mainID] ?? [])].some((entry) => entry.id === session.id)
+  return known || (session.metadata?.sidechat?.version === 1 && session.metadata.sidechat.mainID === mainID)
+}
+
+async function listSideHistory(context: any, mainID: string) {
+  const sessions: any[] = []
+  let cursor: string | undefined
+  const seen = new Set<string>()
+  do {
+    const page = await context.client.session.list(cursor ? { cursor, limit: 100 } : { parentID: mainID, limit: 100 })
+    sessions.push(...page.data)
+    cursor = page.cursor?.next ?? undefined
+    if (cursor && seen.has(cursor)) throw new Error("Repeated SideChat history cursor")
+    if (cursor) seen.add(cursor)
+  } while (cursor)
+  return sessions
+}
+
+function sideHistoryRows(context: any, settings: Settings, runtime: Runtime, mainID: string, sessions: any[], now = Date.now()) {
+  const open = new Set(chatsOf(mainID, settings).list.map((entry) => entry.id))
+  const seen = new Set<string>()
+  return sessions.filter((session) => {
+    if (seen.has(session.id) || !isSideHistorySession(session, mainID, settings)) return false
+    seen.add(session.id)
+    return true
+  }).sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0) || a.id.localeCompare(b.id)).map((session) => {
+    const state = sideChatBusy(context, runtime, session.id) ? "running" : runtime.errors[session.id] || session.outcome === "failed" ? "failed" : "idle"
+    const cost = context.data.session.cost(session.id) ?? session.cost ?? 0
+    return {
+      title: session.title || "Untitled side chat",
+      value: session.id,
+      description: `${open.has(session.id) ? "open" : "closed"} · ${state} · ${historyAge(session.time?.created, now)} · ${typeof cost === "number" && Number.isFinite(cost) ? `$${cost.toFixed(3)}` : "cost unavailable"}${sideChatUnread(session, sideViewed(settings, mainID, session.id)) ? " · unread" : ""}`,
+    }
+  })
+}
+
+async function markSideViewed(context: any, settings: Settings, persist: any, mainID: string, id: string) {
+  const session = context.data.session.get(id)
+  if (!sideChatUnread(session, sideViewed(settings, mainID, id)) || typeof session?.time?.idle !== "number") return
+  const observed = session.time.updated
+  // Acknowledge only the idle boundary we actually displayed, not future output.
+  if (session.time.idle > (session.time.viewed ?? 0)) {
+    await context.client.session.view({ sessionID: id, idle: session.time.idle })
+    await context.data.session.sync(id)
+  }
+  // Renames/metadata also advance updated, but /view acknowledges idle only.
+  // Store the exact displayed update locally without inventing an idle boundary.
+  await persist((draft: Settings) => {
+    for (const entry of [...(draft.chats[mainID]?.list ?? []), ...(draft.closed?.[mainID] ?? [])]) {
+      if (entry.id === id) entry.viewedUpdated = Math.max(entry.viewedUpdated ?? 0, observed)
+    }
+  })
+}
+
+async function runHistoryAction(context: any, settings: Settings, persist: any, runtime: Runtime, mainID: string, id: string, action: string, changeRuntime: ChangeRuntime = (mutation) => mutation(runtime)) {
+  const session = await context.client.session.get({ sessionID: id })
+  if (!isSideHistorySession(session, mainID, settings)) throw new Error("Not a side chat of this main session")
+  if (action === "rename") {
+    const name = await context.ui.dialog.prompt({ title: "Rename side chat", placeholder: session.title || "Side chat" })
+    if (!name?.trim()) return
+    const title = name.trim()
+    await context.client.session.update({ sessionID: id, title })
+    await persist((draft: Settings) => {
+      for (const entry of [...(draft.chats[mainID]?.list ?? []), ...(draft.closed?.[mainID] ?? [])]) {
+        if (entry.id === id) entry.title = title
+      }
+    })
+    await context.data.session.sync(id)
+    return
+  }
+  if (action === "delete") {
+    const blocked = () => {
+      if (!sideChatBusy(context, runtime, id)) return false
+      context.ui.toast.show({ variant: "warning", message: "This side chat is running or busy; stop it before deleting" })
+      return true
+    }
+    await context.data.session.sync(id)
+    if (blocked()) return
+    if (!await context.ui.dialog.confirm({ title: "Delete side chat?", message: `Permanently delete “${session.title || id}” and its child sessions? This cannot be undone.`, label: { confirm: "Delete", cancel: "Cancel" } })) return
+    await context.data.session.sync(id)
+    if (blocked()) return
+    await context.client.session.remove({ sessionID: id })
+    await persist((draft: Settings) => {
+      const chats = draft.chats[mainID]
+      if (chats) {
+        const activeID = chats.list[chats.active]?.id
+        const index = chats.list.findIndex((entry) => entry.id === id)
+        chats.list = chats.list.filter((entry) => entry.id !== id)
+        chats.active = Math.max(0, activeID === id ? Math.min(index, chats.list.length - 1) : chats.list.findIndex((entry) => entry.id === activeID))
+      }
+      if (draft.closed?.[mainID]) draft.closed[mainID] = draft.closed[mainID].filter((entry) => entry.id !== id)
+    })
+    changeRuntime((draft) => {
+      delete draft.drafts[id]; delete draft.submitting[id]; delete draft.active[id]; delete draft.stopping[id]; delete draft.errors[id]
+    })
+    if (context.ui.tabs.enabled()) context.ui.tabs.close(id)
+    context.data.session.invalidate?.(id)
+    if (!chatsOf(mainID, settings).list.length) await createChat(context, settings, persist, mainID)
+    return
+  }
+  if (action === "main") {
+    context.ui.panel.close()
+    if (context.ui.tabs.enabled()) {
+      context.ui.tabs.open(id)
+      context.ui.tabs.focus(id)
+    } else context.ui.router.navigate({ type: "session", sessionID: id })
+    return
+  }
+  if (action === "open" || action === "restore") {
+    const entry = [...chatsOf(mainID, settings).list, ...(settings.closed?.[mainID] ?? [])].find((item) => item.id === id) ??
+      { id, title: session.title || "Side chat", includeContext: session.metadata?.sidechat?.includeContext === true }
+    await restoreChat(context, settings, persist, mainID, entry, action === "open")
+    if (action === "open") context.ui.panel.open(PANEL)
+  }
+}
+
+async function showSideHistory(context: any, settings: Settings, persist: any, runtime: Runtime, mainID: string, changeRuntime: ChangeRuntime) {
+  const sessions = (await listSideHistory(context, mainID)).filter((session) => isSideHistorySession(session, mainID, settings))
+  // Populate the host's cost/status cache, including DB-only chats that are not
+  // currently mounted. Bound parallel reads rather than starting one per chat.
+  for (let offset = 0; offset < sessions.length; offset += 10) {
+    await Promise.all(sessions.slice(offset, offset + 10).map((session) => context.data.session.sync(session.id)))
+  }
+  const rows = sideHistoryRows(context, settings, runtime, mainID, sessions.map((session) => context.data.session.get(session.id) ?? session))
+  if (!rows.length) {
+    context.ui.toast.show({ message: "No side chats saved for this main session", variant: "info" })
+    return
+  }
+  const selected = context.ui.dialog.select({
+    title: "Side chat history", placeholder: "Search titles, status, age or cost…", options: rows,
+    search: (query: string, options: typeof rows) => options.filter((row) => query.toLowerCase().trim().split(/\s+/).every((term) => `${row.title} ${row.description} ${row.value}`.toLowerCase().includes(term))),
+  })
+  // select opens at the host's default size; resize the active picker afterward.
+  context.ui.dialog.set({ size: "large", centered: true })
+  const id = await selected
+  if (!rows.some((row) => row.value === id)) return
+  const action = await context.ui.dialog.select({
+    title: rows.find((row) => row.value === id)!.title,
+    options: [
+      { title: "Open here", value: "open" },
+      { title: "Restore to tab strip", value: "restore" },
+      { title: "Open in main view", value: "main", description: "View this side session; never copy messages into the parent" },
+      { title: "Rename", value: "rename" },
+      { title: "Delete permanently", value: "delete", disabled: sideChatBusy(context, runtime, id), description: "Stop running chats before deleting" },
+    ],
+  })
+  if (action !== undefined) await runHistoryAction(context, settings, persist, runtime, mainID, id, action, changeRuntime)
 }
 
 async function stepChat(context: any, settings: Settings, persist: any, delta: number) {
@@ -748,8 +952,11 @@ function SideChat(props: {
   // Add future composer commands here; suggestions and dispatch share this list.
   const slashCommands: SideChatCommand[] = [
     { name: "models", aliases: ["model"], description: "Switch model", run: () => chooseModel() },
+    { name: "agent", description: "Switch this tab's agent", run: () => chooseAgent() },
     { name: "tabs", description: "Switch side chat tab", run: () => chooseTab() },
-    { name: "new", description: "Start a new side chat", run: () => createChat(context, settings, persist, panel.sessionID) },
+    { name: "history", description: "Browse saved side chats", run: () => chooseHistory() },
+    { name: "copy", description: "Copy this tab's visible questions and answers", run: async () => { await copySideTranscript(context, sideID()) } },
+    { name: "new", description: "Start a new side chat", run: () => chooseNewChat() },
     { name: "close", description: "Close the current tab", run: () => closeChat(context, settings, persist, panel.sessionID, sideID()) },
     { name: "reopen", description: "Reopen the last closed chat", run: () => reopenChat(context, settings, persist, panel.sessionID) },
   ]
@@ -771,6 +978,12 @@ function SideChat(props: {
   const chats = createMemo(() => chatsOf(panel.sessionID, settings))
   const active = () => chats().active
   const sideID = createMemo(() => chats().list[active()]?.id)
+  const includeContext = () => {
+    const entry = chats().list[active()]
+    const flag = entry ? context.data.session.get(entry.id)?.metadata?.sidechat : undefined
+    return flag?.version === 1 && flag.mainID === panel.sessionID && typeof flag.includeContext === "boolean"
+      ? flag.includeContext : entryContext(entry)
+  }
   const running = () => {
     const id = sideID()
     return !!id && context.data.session.status(id) === "running"
@@ -859,15 +1072,22 @@ function SideChat(props: {
 
   const loadTranscript = async (id: string) => {
     try {
-      await ensurePlanAgent(context, id)
       await Promise.all([
         context.data.session.sync(id),
         context.data.session.message.sync(id),
       ])
     } catch (cause: unknown) {
-      setError(`Could not prepare Plan mode: ${String((cause as any)?.message ?? cause)}`, id)
+      setError(`Could not load side chat: ${String((cause as any)?.message ?? cause)}`, id)
     }
   }
+
+  createEffect(() => {
+    const id = sideID()
+    if (!id || !ready() || !panel.focused || busy() || awayFromBottom()) return
+    const session = context.data.session.get(id)
+    if (!sideChatUnread(session, sideViewed(settings, panel.sessionID, id)) || session?.time?.idle == null) return
+    void markSideViewed(context, settings, persist, panel.sessionID, id).catch(() => undefined)
+  })
 
   // Watch session identity: closing a tab can replace it at the same index.
   createEffect(() => {
@@ -968,6 +1188,31 @@ function SideChat(props: {
     }
   }
 
+  async function chooseAgent() {
+    const id = sideID()
+    if (!id || pickerOpen()) return
+    resetInterrupt()
+    setPickerOpen(true)
+    try {
+      await pickSideChatAgent(context, id)
+    } catch (cause: any) {
+      context.ui.toast.show({ variant: "error", message: `Could not select a side chat agent: ${String(cause?.message ?? cause)}` })
+    } finally {
+      setPickerOpen(false)
+      focusInput()
+    }
+  }
+
+  async function chooseNewChat() {
+    if (pickerOpen()) return
+    resetInterrupt()
+    setPickerOpen(true)
+    try { await createChat(context, settings, persist, panel.sessionID, true) } finally {
+      setPickerOpen(false)
+      focusInput()
+    }
+  }
+
   async function chooseTab() {
     if (pickerOpen()) return
     resetInterrupt()
@@ -990,6 +1235,20 @@ function SideChat(props: {
         const index = current?.list.findIndex((entry) => entry.id === chosen) ?? -1
         if (current && index >= 0) current.active = index
       })
+    } finally {
+      setPickerOpen(false)
+      focusInput()
+    }
+  }
+
+  async function chooseHistory() {
+    if (pickerOpen()) return
+    resetInterrupt()
+    setPickerOpen(true)
+    try {
+      await showSideHistory(context, settings, persist, runtime, panel.sessionID, changeRuntime)
+    } catch (cause: unknown) {
+      context.ui.toast.show({ variant: "error", message: `SideChat history: ${String((cause as any)?.message ?? cause)}` })
     } finally {
       setPickerOpen(false)
       focusInput()
@@ -1103,7 +1362,6 @@ function SideChat(props: {
   async function submit() {
     const id = sideID()
     const mainID = panel.sessionID
-    const includeContext = settings.includeContext
     const question = readComposer().trim()
     const command = commandSuggestions()[commandIndex()] ?? slashCommands.find((item) =>
       [item.name, ...(item.aliases ?? [])].some((name) => question.toLowerCase() === `/${name}`),
@@ -1112,7 +1370,11 @@ function SideChat(props: {
       await runCommand(command)
       return
     }
-    if (!id || !question || busy() || pickerOpen()) return
+    if (!id || !question || pickerOpen()) return
+    if (busy()) {
+      context.ui.toast.show({ variant: "warning", message: "SideChat is busy; your question is still in the draft" })
+      return
+    }
     const entry = chats().list.find((chat) => chat.id === id)
     setDraft("", id)
     try {
@@ -1122,8 +1384,8 @@ function SideChat(props: {
     scrollToEnd()
     let admitted = false
     try {
-      // Plan is enforced for every request, including pre-existing Build tabs.
-      await ensurePlanAgent(context, id)
+      const enabled = await configureSideContext(context, mainID, id, entryContext(entry))
+      await rememberSideContext(persist, mainID, id, enabled)
       // Auto-title the first exchange.
       if (entry && (entry.title === "New chat" || !entry.title)) {
         const title = question.replace(/\s+/g, " ").slice(0, TITLE_MAX)
@@ -1136,16 +1398,9 @@ function SideChat(props: {
         void context.client.session.update?.({ sessionID: id, title }).catch(() => undefined)
       }
 
-      const shared = includeContext ? await prepareMainContext(context, mainID, id) : undefined
-      const promptText = shared?.body ? `${shared.body}\n\n[Question]\n${question}` : question
       changeRuntime((draft) => { draft.active[id] = true })
-      // OpenCode saves this receipt atomically with the admitted prompt. Failed
-      // sends cannot advance it; accepted pending prompts survive restarts too.
-      await context.client.session.prompt({
-        sessionID: id,
-        text: promptText,
-        ...(shared ? { metadata: { [CONTEXT_RECEIPT]: shared.receipt } } : {}),
-      })
+      const session = context.data.session.get(id)
+      await sendSideQuestion(context, id, question, session?.location ?? context.location)
       admitted = true
       void context.data.session.message.sync(id).catch(() => undefined)
     } catch (cause: unknown) {
@@ -1229,6 +1484,7 @@ function SideChat(props: {
                       flexShrink={1}
                     >
                       {selected() ? `› ${tabLabel(entry.title)} ‹` : tabLabel(entry.title)}
+                      {sideChatBusy(context, runtime, entry.id) ? " …" : sideChatUnread(context.data.session.get(entry.id), entry.viewedUpdated) ? " ●" : ""}
                     </text>
                     <text
                       fg={selected() ? theme().text.base : muted()}
@@ -1247,7 +1503,7 @@ function SideChat(props: {
             <text
               fg={muted()}
               flexShrink={0}
-              onMouseUp={() => void createChat(context, settings, persist, panel.sessionID)}
+              onMouseUp={() => void chooseNewChat()}
             >
               +
             </text>
@@ -1256,17 +1512,17 @@ function SideChat(props: {
           <box height={1} flexDirection="row" gap={1} flexShrink={0} alignItems="center">
             <box
               height={1} flexDirection="row" gap={1} flexShrink={1} minWidth={10}
-              onMouseUp={() => void persist((draft) => (draft.includeContext = !draft.includeContext))}
+              onMouseUp={() => void toggleMainContext(context, settings, persist, panel.sessionID)}
             >
-              <text fg={settings.includeContext ? theme().text.feedback.success.base : muted()} flexShrink={0}>
-                {settings.includeContext ? "●" : "○"}
-              </text>
-              <text fg={muted()} wrapMode="none" truncate flexShrink={1} minWidth={0}>Main context</text>
-              <text fg={settings.includeContext ? theme().text.feedback.success.base : muted()}
-                attributes={settings.includeContext ? TextAttributes.BOLD : 0} flexShrink={0}>
-                {settings.includeContext ? "ON" : "OFF"}
+              <text fg={muted()} wrapMode="none" truncate flexShrink={1} minWidth={0}>main context: hidden ·</text>
+              <text fg={includeContext() ? theme().text.feedback.success.base : muted()}
+                attributes={includeContext() ? TextAttributes.BOLD : 0} flexShrink={0}>
+                {includeContext() ? "ON" : "OFF"}
               </text>
             </box>
+            <text fg={muted()} wrapMode="none" truncate minWidth={0} maxWidth={16} flexShrink={1} onMouseUp={() => void chooseAgent()}>
+              {context.data.session.get(sideID() ?? "")?.agent ?? "build"} ▾
+            </text>
             <box
               height={1} border={["left", "right"]} borderColor={theme().border.base}
               paddingLeft={1} paddingRight={1} flexDirection="row" gap={1} flexShrink={1} minWidth={5}
@@ -1458,8 +1714,8 @@ function SideChat(props: {
               onKeyDown={onComposerKeyDown}
               onSubmit={() => void submit()}
               placeholder={
-                settings.includeContext
-                  ? "Ask with main context… (/ commands · enter sends · shift+enter newline)"
+                includeContext()
+                  ? "Ask with hidden main context… (/ commands · enter sends · shift+enter newline)"
                   : "Ask the side chat… (/ commands · enter sends · shift+enter newline)"
               }
               placeholderColor={muted()}
@@ -1733,11 +1989,7 @@ function MessageView(props: MessageViewProps) {
   const keyFor = (id: string) => `${message().id}:${id}`
   const toggle = (id: string) => { if (!hasSelection()) props.onToggle(keyFor(id)) }
   const groups = createMemo(() => assistantGroups(message().content ?? []))
-  const userText = () => {
-    const raw = String(message().text ?? "")
-    const marker = raw.lastIndexOf("[Question]")
-    return marker >= 0 ? raw.slice(marker + "[Question]".length).trim() : raw
-  }
+  const userText = () => sideQuestionText(message())
   const agent = () => String(message().agent ?? "build")
   const agentColor = () => sideAgentColor(props.context, theme(), agent())
   const modelLabel = () => {
@@ -1757,6 +2009,9 @@ function MessageView(props: MessageViewProps) {
           paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2}
         >
           <text fg={theme().text.base} wrapMode="word">{userText()}</text>
+          <Show when={contextOmissionNote(message())}>
+            <text fg={theme().text.muted} wrapMode="word">{contextOmissionNote(message())}</text>
+          </Show>
         </box>
       </Show>
       <Show when={message().type === "assistant"}>
