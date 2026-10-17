@@ -10,7 +10,7 @@ build step, no `cli.json` entry needed.
 ## Install
 
 ```bash
-git clone https://github.com/Ray726-I/opencode-sidechat-v2 ~/.config/opencode/plugins/sidechat
+git clone https://github.com/Ray726-I/opencode-sidechat ~/.config/opencode/plugins/sidechat
 ```
 
 Restart `opencode`. OpenCode discovers plugins under
