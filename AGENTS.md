@@ -130,5 +130,6 @@ The README carries the detail; these are the non-negotiables:
 - Keep the plugin a single `tui.tsx` plus `README.md`. Ask before adding files,
   dependencies, or tooling to the repo.
 - Commit only when asked, with a descriptive subject (plugin changes use a
-  `SideChat: <change>` prefix).
+  `SideChat: <change>` prefix). Each change lands as a new commit: never
+  amend, squash, rebase, or force-push commits that are already public.
 - Update `README.md` when behavior, commands, or keybinds change.
