@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Local check environment
+.check/
+
+# Logs
+*.log
+npm-debug.log*
+bun-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local env
+.env
+.env.local
