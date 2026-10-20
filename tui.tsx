@@ -19,7 +19,7 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui"
 import { RGBA, SyntaxStyle, TextAttributes, ScrollBoxRenderable, type BoxRenderable, type ColorInput, type MarkdownRenderable } from "@opentui/core"
-import { Portal } from "@opentui/solid"
+import { Portal, useRenderer } from "@opentui/solid"
 import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js"
 
 const PANEL = "sidechat.panel"
@@ -821,10 +821,16 @@ async function stepChat(context: any, settings: Settings, persist: any, delta: n
 
 /* ---------- panel ---------- */
 
-function sideChatSyntax(theme: any) {
+// OpenTUI 0.6 requires an owner; 0.5 safely ignores the extra argument.
+function ownedSyntaxStyle(styles: Parameters<typeof SyntaxStyle.fromStyles>[0], renderer: any): SyntaxStyle {
+  const fromStyles: (styles: Parameters<typeof SyntaxStyle.fromStyles>[0], owner: any) => SyntaxStyle = SyntaxStyle.fromStyles.bind(SyntaxStyle)
+  return fromStyles(styles, renderer.nativeScene ?? renderer)
+}
+
+function sideChatSyntax(theme: any, renderer: ReturnType<typeof useRenderer>) {
   const syntax = theme.syntax
   const markdown = theme.markdown
-  return SyntaxStyle.fromStyles({
+  return ownedSyntaxStyle({
     default: { fg: theme.text.base },
     spell: { fg: markdown.text },
     nospell: { fg: markdown.text },
@@ -874,7 +880,7 @@ function sideChatSyntax(theme: any) {
     namespace: { fg: syntax.type },
     punctuation: { fg: syntax.punctuation },
     "punctuation.special": { fg: syntax.operator },
-  })
+  }, renderer)
 }
 
 function useChatSurface(context: any, panel: any) {
@@ -913,6 +919,7 @@ function SideChat(props: {
   changeRuntime: ChangeRuntime
 }) {
   const { context, panel, settings, persist, runtime, changeRuntime } = props
+  const renderer = useRenderer()
   const theme = () => context.theme
   const background = () => theme().background.base
   const attachSurface = useChatSurface(context, panel)
@@ -927,7 +934,7 @@ function SideChat(props: {
   }
   let currentSyntax: SyntaxStyle | undefined
   const syntaxStyle = createMemo(() => {
-    const next = sideChatSyntax(theme())
+    const next = sideChatSyntax(theme(), renderer)
     if (currentSyntax) releaseSyntax(currentSyntax)
     return currentSyntax = next
   })
@@ -2112,6 +2119,7 @@ function toolGroupLabel(parts: any[]) {
 function ThoughtGroup(props: {
   parts: any[]; message: any; theme: any; syntaxStyle: SyntaxStyle; renderer: any; expanded: boolean; onToggle: () => void
 }) {
+  const renderer = useRenderer()
   const text = () => props.parts.map((part) => String(part.text ?? "").replace(/\[REDACTED\]/g, "").trim()).filter(Boolean).join("\n\n")
   const title = () => /^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/.exec(text())?.[1]?.trim()
   const done = () => props.message.time?.completed !== undefined || props.parts.every((part) => part.time?.completed !== undefined)
@@ -2130,7 +2138,7 @@ function ThoughtGroup(props: {
       return source
     }
     const color = props.theme.text.muted
-    const next = SyntaxStyle.fromStyles(Object.fromEntries(source.getRegisteredNames().map((name) => [name, { ...source.getStyle(name), fg: color }])))
+    const next = ownedSyntaxStyle(Object.fromEntries(source.getRegisteredNames().map((name) => [name, { ...source.getStyle(name), fg: color }])), renderer)
     if (current) release(current)
     return current = next
   })
