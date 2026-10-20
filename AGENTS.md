@@ -159,7 +159,11 @@ The README carries the detail; these are the non-negotiables:
 - Keep the plugin a `tui.tsx` (panel) plus `index.ts` (server half) and
   `README.md`. Ask before adding files, dependencies, or tooling to
   the repo.
-- Commit only when asked, with a descriptive subject (plugin changes use a
-  `SideChat: <change>` prefix). Each change lands as a new commit: never
-  amend, squash, rebase, or force-push commits that are already public.
+- Commit only when asked. Use a descriptive Conventional Commit subject:
+  `<type>: <change>` (for example, `fix: bind syntax styles to the renderer owner`).
+  Choose the type that matches the change, such as `fix`, `feat`, `docs`,
+  `refactor`, `test`, or `chore`; add an optional scope when it helps.
+  Do not prepend the project name to every commit subject.
+  Each change lands as a new commit: never amend, squash, rebase, or
+  force-push commits that are already public.
 - Update `README.md` when behavior, commands, or keybinds change.
